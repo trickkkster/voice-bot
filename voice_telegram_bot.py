@@ -174,6 +174,32 @@ def needs_search(question):
     question_lower = question.lower()
     return any(trigger in question_lower for trigger in search_triggers)
 
+def search_music(query):
+    """Ищем музыку через YouTube поиск"""
+    try:
+        music_session = make_session()
+        search_query = query.replace(" ", "+")
+        response = music_session.get(
+            f"https://www.youtube.com/results?search_query={search_query}",
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+
+        # Ищем первый videoId в результатах
+        import re
+        video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', response.text)
+        titles = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"', response.text)
+
+        if video_ids:
+            video_id = video_ids[0]
+            title = titles[0] if titles else query
+            link = f"https://youtube.com/watch?v={video_id}"
+            return f"{title}\n{link}"
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка поиска музыки: {e}")
+        return None
+
 def get_currency():
     """Получаем курс валют"""
     try:
@@ -259,6 +285,7 @@ def classify_intent(question):
                 "messages": [{
                     "role": "user",
                     "content": f"""Определи намерение пользователя. Ответь ТОЛЬКО одним словом без пояснений:
+- "search" если спрашивает про новости, что происходит, что случилось, актуальные события, любую свежую информацию из интернета
 - "weather" если спрашивает про погоду, температуру, дождь, солнце на улице
 - "crypto_bitcoin" если про биткоин
 - "crypto_ethereum" если про эфириум
@@ -266,10 +293,15 @@ def classify_intent(question):
 - "currency" если спрашивает про курс доллара, евро, юаня
 - "math" если нужно что-то посчитать/вычислить
 - "reminder" если просит напомнить о чём-то, поставить напоминание, будильник
+- "music" если просит найти песню, музыку, трек, включить что-то послушать
 - "translate" если просит перевести текст на другой язык
 - "write_text" если просит написать письмо, пост, сообщение, текст для чего-то
-- "search" если нужна общая актуальная информация из интернета, новости
 - "chat" если это обычный разговор, не требующий данных
+
+Примеры:
+"какие новости?" → search
+"что нового сегодня?" → search
+"что происходит в мире?" → search
 
 Вопрос: "{question}"
 
@@ -334,9 +366,37 @@ def get_weather(city="Краснодар"):
         print(f"❌ ОШИБКА погоды: {type(e).__name__}: {e}")
         return None
 
-def search_web(query):
-    """Ищем информацию через DuckDuckGo"""
+def get_latest_news():
+    """Получаем последние новости через RSS РБК"""
     try:
+        import xml.etree.ElementTree as ET
+        news_session = make_session()
+        response = news_session.get(
+            "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+            timeout=15
+        )
+        root = ET.fromstring(response.content)
+        items = root.findall(".//item")[:8]
+        news_list = []
+        for item in items:
+            title = item.find("title")
+            if title is not None and title.text:
+                news_list.append(title.text.strip())
+        return "\n".join([f"• {n}" for n in news_list]) if news_list else None
+    except Exception as e:
+        print(f"❌ Ошибка новостей: {e}")
+        return None
+
+def search_web(query):
+    """Ищем информацию через DuckDuckGo, с резервом RSS для новостей"""
+    try:
+        # Если спрашивают именно новости - сразу используем RSS (надёжнее)
+        query_lower = query.lower()
+        if any(w in query_lower for w in ["новост", "что происходит", "что случилось", "что нового"]):
+            news = get_latest_news()
+            if news:
+                return news
+
         search_session = make_session()
         response = search_session.get(
             "https://api.duckduckgo.com/",
@@ -354,10 +414,14 @@ def search_web(query):
             topics = data["RelatedTopics"][:3]
             result_text = " ".join([t.get("Text", "") for t in topics if "Text" in t])
 
-        return result_text if result_text else None
+        # Если DuckDuckGo не дал ответа - тоже пробуем новости как fallback
+        if not result_text:
+            return get_latest_news()
+
+        return result_text
     except Exception as e:
         print(f"❌ ОШИБКА поиска: {type(e).__name__}: {e}")
-        return None
+        return get_latest_news()
 
 def ask_groq(question):
     """Отправляем вопрос с учётом памяти и поиска"""
@@ -387,6 +451,11 @@ def ask_groq(question):
     elif intent == "currency":
         print(f"💱 Проверяю курс валют...")
         search_result = get_currency()
+    elif intent == "music":
+        print(f"🎵 Ищу музыку...")
+        search_result = search_music(question)
+        if search_result:
+            print(f"✅ Найдено: {search_result[:100]}")
     elif intent == "reminder":
         print(f"⏰ Сохраняю напоминание...")
         add_reminder(question, CHAT_ID)
@@ -476,6 +545,33 @@ greeting += "Отправь мне:\n• Голосовое сообщение �
 
 send_message(CHAT_ID, greeting)
 
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "")  # например TricksterBot без @
+
+def should_respond_in_group(message):
+    """В группах отвечаем только если бота упомянули или ответили на его сообщение"""
+    chat_type = message.get("chat", {}).get("type", "private")
+
+    if chat_type == "private":
+        return True  # В личке отвечаем всегда
+
+    # В группе проверяем упоминание
+    text = message.get("text", "") or message.get("caption", "")
+    if BOT_USERNAME and f"@{BOT_USERNAME}" in text:
+        return True
+
+    # Проверяем реплай на сообщение бота
+    reply_to = message.get("reply_to_message", {})
+    if reply_to.get("from", {}).get("is_bot"):
+        return True
+
+    return False
+
+def clean_mention(text):
+    """Убираем упоминание бота из текста"""
+    if BOT_USERNAME:
+        text = text.replace(f"@{BOT_USERNAME}", "").strip()
+    return text
+
 offset = 0
 while True:
     updates = get_updates(offset)
@@ -484,6 +580,10 @@ while True:
         offset = update["update_id"] + 1
         message = update.get("message", {})
         chat_id = message.get("chat", {}).get("id")
+
+        # Проверяем нужно ли отвечать (важно для групп)
+        if not should_respond_in_group(message):
+            continue
 
         if "photo" in message:
             print("📸 Получено фото!")
@@ -528,7 +628,7 @@ while True:
                     send_message(chat_id, "❌ Не смог распознать. Напиши текстом!")
 
         elif "text" in message:
-            text = message["text"]
+            text = clean_mention(message["text"])
             if text == "/start":
                 send_message(chat_id, greeting)
             elif text == "/clear":
